@@ -2,48 +2,164 @@ name: Build and Push Mosquitto
 
 on:
   schedule:
-    - cron: '0 */6 * * *' # Check every 6 hours
+    - cron: '0 */6 * * *'
   push:
-    branches: [ "master" ]
+    branches: ["master"]
   workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mosquitto-build-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   check-upstream:
     runs-on: ubuntu-latest
+
     outputs:
       should_build: ${{ steps.check.outputs.should_build }}
-      upstream_digest: ${{ steps.check.outputs.upstream_digest }}
-    steps:
-      - name: Check for updates
-        id: check
-        run: |
-          # Use skopeo to query the remote registry metadata for the base Alpine image
-          UPSTREAM_DIGEST=$(skopeo inspect docker://alpine:3.23 | jq -r '.Digest')
-          
-          # Query our own image to see what base digest it was last built with
-          CURRENT_BASE_DIGEST=$(skopeo inspect docker://solodolobolo/mosquitto:latest 2>/dev/null | jq -r '.Labels["org.opencontainers.image.base.digest"]' || echo "none")
-          
-          echo "Upstream Digest: $UPSTREAM_DIGEST"
-          echo "Current Base Digest: $CURRENT_BASE_DIGEST"
-          
-          echo "upstream_digest=$UPSTREAM_DIGEST" >> $GITHUB_OUTPUT
-          
-          # Force a build if it's a manual trigger, a push to master, OR if the digests don't match
-          if [ "$UPSTREAM_DIGEST" != "$CURRENT_BASE_DIGEST" ] || [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "should_build=true" >> $GITHUB_OUTPUT
-            echo "Update found or manual/push trigger detected. Building."
-          else
-            echo "should_build=false" >> $GITHUB_OUTPUT
-            echo "No updates to base image. Skipping build."
-          fi
+      lws_version: ${{ steps.check.outputs.lws_version }}
+      cjson_version: ${{ steps.check.outputs.cjson_version }}
+      mosq_version: ${{ steps.check.outputs.mosq_version }}
 
-  build:
-    needs: check-upstream
-    if: needs.check-upstream.outputs.should_build == 'true'
-    runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Check versions
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          import time
+          import urllib.request
+          from pathlib import Path
+
+          packages = {
+              "lws": ("LWS_VERSION", "warmcat/libwebsockets"),
+              "cjson": ("CJSON_VERSION", "DaveGamble/cJSON"),
+              "mosq": ("MOSQUITTO_VERSION", "eclipse-mosquitto/mosquitto"),
+          }
+
+          dockerfile = Path("Dockerfile").read_text()
+
+          def version_key(value):
+              return tuple(map(int, value.split(".")))
+
+          def current_version(argument):
+              pattern = (
+                  rf"^[ \t]*ARG[ \t]+{argument}[ \t]*=[ \t]*"
+                  rf"[\"']?(\d+\.\d+\.\d+)[\"']?[ \t]*(?:#.*)?$"
+              )
+              matches = re.findall(pattern, dockerfile, re.MULTILINE)
+
+              if len(matches) != 1:
+                  raise RuntimeError(
+                      f"Expected exactly one ARG {argument}=x.y.z"
+                  )
+
+              return matches[0]
+
+          def latest_version(repository):
+              for attempt in range(3):
+                  try:
+                      request = urllib.request.Request(
+                          f"https://api.github.com/repos/{repository}/git/refs/tags",
+                          headers={
+                              "Authorization": f"Bearer {os.environ['GH_TOKEN']}",
+                              "Accept": "application/vnd.github+json",
+                              "User-Agent": "mosquitto-version-checker",
+                          },
+                      )
+
+                      with urllib.request.urlopen(request, timeout=30) as response:
+                          refs = json.load(response)
+
+                      if not isinstance(refs, list):
+                          raise RuntimeError(
+                              f"Unexpected tag response for {repository}"
+                          )
+
+                      versions = []
+
+                      for item in refs:
+                          tag = item["ref"].removeprefix("refs/tags/")
+                          if re.fullmatch(r"v?\d+\.\d+\.\d+", tag):
+                              versions.append(tag.removeprefix("v"))
+
+                      if not versions:
+                          raise RuntimeError(
+                              f"No stable tags found for {repository}"
+                          )
+
+                      return max(versions, key=version_key)
+
+                  except Exception:
+                      if attempt == 2:
+                          raise
+                      time.sleep(3)
+
+          selected = {}
+          updates = False
+
+          for key, (argument, repository) in packages.items():
+              current = current_version(argument)
+              latest = latest_version(repository)
+              newer = version_key(latest) > version_key(current)
+
+              selected[key] = latest if newer else current
+              updates |= newer
+
+              print(
+                  f"{argument}: current={current}, upstream={latest}, "
+                  f"selected={selected[key]}"
+              )
+
+          should_build = (
+              updates or os.environ["EVENT_NAME"] == "workflow_dispatch"
+          )
+
+          print(f"Build required: {should_build}")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"should_build={str(should_build).lower()}\n")
+              output.write(f"lws_version={selected['lws']}\n")
+              output.write(f"cjson_version={selected['cjson']}\n")
+              output.write(f"mosq_version={selected['mosq']}\n")
+          PY
+
+  build-and-test:
+    needs: check-upstream
+    if: needs.check-upstream.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+
+    env:
+      IMAGE: solodolobolo/mosquitto
+      TEST_IMAGE: mosquitto-ci:${{ matrix.arch }}
+      LWS_VERSION: ${{ needs.check-upstream.outputs.lws_version }}
+      CJSON_VERSION: ${{ needs.check-upstream.outputs.cjson_version }}
+      MOSQUITTO_VERSION: ${{ needs.check-upstream.outputs.mosq_version }}
+      MQTT_USER: ci-test-user
+      MQTT_PASSWORD: ci-test-password
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
@@ -57,16 +173,674 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-      - name: Build and push
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: solodolobolo/mosquitto:latest
+          platforms: linux/${{ matrix.arch }}
+          load: true
+          push: false
           pull: true
-          labels: |
-            org.opencontainers.image.base.name=alpine:3.23
-            org.opencontainers.image.base.digest=${{ needs.check-upstream.outputs.upstream_digest }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          provenance: false
+          tags: ${{ env.TEST_IMAGE }}
+          build-args: |
+            LWS_VERSION=${{ env.LWS_VERSION }}
+            CJSON_VERSION=${{ env.CJSON_VERSION }}
+            MOSQUITTO_VERSION=${{ env.MOSQUITTO_VERSION }}
+          cache-from: type=gha,scope=mosquitto-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=mosquitto-${{ matrix.arch }}
+
+      - name: Check architecture
+        env:
+          EXPECTED_ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          actual="$(docker image inspect \
+            --format '{{.Architecture}}' "$TEST_IMAGE")"
+
+          echo "Expected: $EXPECTED_ARCH; actual: $actual"
+          test "$actual" = "$EXPECTED_ARCH"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install test dependencies
+        run: python -m pip install paho-mqtt==2.1.0
+
+      - name: Test executables
+        run: |
+          set -euo pipefail
+
+          docker run --rm --entrypoint /bin/sh "$TEST_IMAGE" -ec '
+            for executable in \
+              /usr/sbin/mosquitto \
+              /usr/bin/mosquitto_pub \
+              /usr/bin/mosquitto_sub \
+              /usr/bin/mosquitto_rr \
+              /usr/bin/mosquitto_ctrl \
+              /usr/bin/mosquitto_passwd
+            do
+              echo "Checking $executable"
+              test -x "$executable"
+              ldd "$executable"
+            done
+
+            mosquitto_passwd -b -c \
+              /tmp/passwords testuser testpassword
+
+            test -s /tmp/passwords
+            grep -q "^testuser:" /tmp/passwords
+
+            mosquitto_ctrl dynsec init \
+              /tmp/dynamic-security.json testadmin testpassword
+
+            test -s /tmp/dynamic-security.json
+          '
+
+      - name: Test dynamic security
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          docker run --rm --entrypoint /bin/sh "$TEST_IMAGE" -ec '
+            mosquitto_ctrl dynsec init \
+              /tmp/dynamic-security.json testadmin testpassword
+
+            chown mosquitto:mosquitto /tmp/dynamic-security.json
+
+            printf "%s\n" \
+              "user mosquitto" \
+              "listener 18883 127.0.0.1" \
+              "persistence false" \
+              "log_dest stdout" \
+              "plugin /usr/lib/mosquitto_dynamic_security.so" \
+              "plugin_opt_config_file /tmp/dynamic-security.json" \
+              > /tmp/plugin-test.conf
+
+            mosquitto -c /tmp/plugin-test.conf \
+              > /tmp/broker.log 2>&1 &
+
+            broker_pid=$!
+            trap "kill $broker_pid 2>/dev/null || true" EXIT
+
+            ready=no
+
+            for attempt in $(seq 1 30); do
+              if ! kill -0 "$broker_pid" 2>/dev/null; then
+                cat /tmp/broker.log
+                exit 1
+              fi
+
+              if timeout 5 mosquitto_pub \
+                  -h 127.0.0.1 -p 18883 \
+                  -u testadmin -P testpassword \
+                  -t "\$CONTROL/dynamic-security/v1" \
+                  -m "{\"commands\":[{\"command\":\"listClients\"}]}" \
+                  -q 1 >/dev/null 2>&1; then
+                ready=yes
+                break
+              fi
+
+              sleep 1
+            done
+
+            cat /tmp/broker.log
+            test "$ready" = yes
+
+            timeout 20 mosquitto_sub \
+              -h 127.0.0.1 -p 18883 \
+              -u testadmin -P testpassword \
+              -t "\$CONTROL/dynamic-security/v1/response" \
+              -C 1 -W 15 \
+              > /tmp/control-response.json &
+
+            subscriber_pid=$!
+            sleep 2
+
+            mosquitto_pub \
+              -h 127.0.0.1 -p 18883 \
+              -u testadmin -P testpassword \
+              -t "\$CONTROL/dynamic-security/v1" \
+              -m "{\"commands\":[{\"command\":\"listClients\"}]}" \
+              -q 1
+
+            wait "$subscriber_pid"
+
+            cat /tmp/control-response.json
+            grep -q "testadmin" /tmp/control-response.json
+
+            if timeout 10 mosquitto_pub \
+                -h 127.0.0.1 -p 18883 \
+                -u testadmin -P wrongpassword \
+                -t dev/invalid-auth -m forbidden -q 1; then
+              echo "ERROR: Invalid credentials were accepted"
+              exit 1
+            fi
+          '
+
+      - name: Start broker
+        run: |
+          set -euo pipefail
+
+          docker run -d \
+            --name test_broker \
+            -e MQTT_USER \
+            -e MQTT_PASSWORD \
+            -p 127.0.0.1:1883:1883 \
+            -p 127.0.0.1:9001:9001 \
+            "$TEST_IMAGE"
+
+      - name: Test MQTT and WebSockets
+        timeout-minutes: 10
+        run: |
+          python - <<'PY'
+          import itertools
+          import os
+          import subprocess
+          import threading
+          import time
+          import uuid
+
+          import paho.mqtt.client as mqtt
+
+          endpoints = {
+              "tcp": 1883,
+              "websockets": 9001,
+          }
+
+          def check_broker():
+              result = subprocess.run(
+                  [
+                      "docker", "inspect",
+                      "--format", "{{.State.Running}}",
+                      "test_broker",
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+
+              if result.stdout.strip() != "true":
+                  raise RuntimeError("Broker exited; see cleanup logs")
+
+          def close(client):
+              try:
+                  client.disconnect()
+              finally:
+                  client.loop_stop()
+
+          def connect(transport, protocol):
+              client = mqtt.Client(
+                  callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
+                  client_id=f"ci-{uuid.uuid4().hex}",
+                  protocol=protocol,
+                  transport=transport,
+              )
+
+              client.username_pw_set(
+                  os.environ["MQTT_USER"],
+                  os.environ["MQTT_PASSWORD"],
+              )
+              client.connect_timeout = 10
+
+              connected = threading.Event()
+              errors = []
+
+              def on_connect(
+                  client, userdata, flags, reason, properties
+              ):
+                  if reason.is_failure:
+                      errors.append(str(reason))
+                  connected.set()
+
+              client.on_connect = on_connect
+
+              if transport == "websockets":
+                  client.ws_set_options(path="/mqtt")
+
+              try:
+                  client.connect(
+                      "127.0.0.1",
+                      endpoints[transport],
+                      keepalive=30,
+                  )
+                  client.loop_start()
+
+                  if not connected.wait(15):
+                      raise RuntimeError(
+                          f"{transport}: CONNACK timeout"
+                      )
+                  if errors:
+                      raise RuntimeError(
+                          f"{transport}: connection rejected: {errors}"
+                      )
+
+                  return client
+
+              except Exception:
+                  close(client)
+                  raise
+
+          for transport in endpoints:
+              deadline = time.monotonic() + 60
+
+              while True:
+                  check_broker()
+
+                  try:
+                      client = connect(transport, mqtt.MQTTv311)
+                      close(client)
+                      print(f"READY: {transport}", flush=True)
+                      break
+
+                  except Exception as error:
+                      if time.monotonic() >= deadline:
+                          raise
+
+                      print(
+                          f"Waiting for {transport}: {error}",
+                          flush=True,
+                      )
+                      time.sleep(1)
+
+          protocols = [
+              ("MQTT-3.1.1", mqtt.MQTTv311),
+              ("MQTT-5", mqtt.MQTTv5),
+          ]
+
+          for protocol_name, protocol in protocols:
+              for source, destination, qos in itertools.product(
+                  endpoints, endpoints, (0, 1, 2)
+              ):
+                  check_broker()
+
+                  topic = f"ci/{uuid.uuid4().hex}"
+                  payload = (
+                      f"{protocol_name}:{source}->{destination}:qos{qos}"
+                  ).encode()
+
+                  subscribed = threading.Event()
+                  received = threading.Event()
+                  errors = []
+                  messages = []
+
+                  subscriber = connect(destination, protocol)
+                  publisher = None
+
+                  try:
+                      def on_subscribe(
+                          client, userdata, mid, reasons, properties
+                      ):
+                          if any(reason.is_failure for reason in reasons):
+                              errors.append(str(reasons))
+                          subscribed.set()
+
+                      def on_message(client, userdata, message):
+                          messages.append(
+                              (message.payload, message.qos)
+                          )
+                          received.set()
+
+                      subscriber.on_subscribe = on_subscribe
+                      subscriber.on_message = on_message
+
+                      result, _ = subscriber.subscribe(topic, qos=qos)
+
+                      assert result == mqtt.MQTT_ERR_SUCCESS
+                      assert subscribed.wait(15), "SUBACK timeout"
+                      assert not errors, errors
+
+                      publisher = connect(source, protocol)
+                      publication = publisher.publish(
+                          topic, payload, qos=qos
+                      )
+                      publication.wait_for_publish(timeout=15)
+
+                      assert publication.is_published(), "Publish timeout"
+                      assert received.wait(15), "Delivery timeout"
+                      assert messages[0] == (payload, qos), messages
+
+                      print(
+                          f"PASS: {payload.decode()}",
+                          flush=True,
+                      )
+
+                  finally:
+                      if publisher is not None:
+                          close(publisher)
+                      close(subscriber)
+
+          for transport in endpoints:
+              topic = f"ci/retained/{uuid.uuid4().hex}"
+
+              publisher = connect(transport, mqtt.MQTTv311)
+              subscriber = None
+
+              try:
+                  publication = publisher.publish(
+                      topic, b"RETAINED_OK", qos=1, retain=True
+                  )
+                  publication.wait_for_publish(timeout=15)
+
+                  assert publication.is_published()
+
+                  received = threading.Event()
+                  messages = []
+
+                  subscriber = connect(transport, mqtt.MQTTv311)
+
+                  def on_message(client, userdata, message):
+                      messages.append(
+                          (message.payload, message.retain)
+                      )
+                      received.set()
+
+                  subscriber.on_message = on_message
+                  subscriber.subscribe(topic, qos=1)
+
+                  assert received.wait(15), "Retained delivery timeout"
+                  assert messages[0] == (b"RETAINED_OK", True), messages
+
+                  publication = publisher.publish(
+                      topic, b"", qos=1, retain=True
+                  )
+                  publication.wait_for_publish(timeout=15)
+
+                  assert publication.is_published()
+
+                  print(
+                      f"PASS: retained delivery over {transport}",
+                      flush=True,
+                  )
+
+              finally:
+                  if subscriber is not None:
+                      close(subscriber)
+                  close(publisher)
+
+          print("ALL TCP AND WEBSOCKET TESTS PASSED", flush=True)
+          PY
+
+      - name: Test command-line clients
+        run: |
+          set -euo pipefail
+
+          docker exec test_broker mosquitto_pub \
+            -h 127.0.0.1 -p 1883 \
+            -u "$MQTT_USER" -P "$MQTT_PASSWORD" \
+            -t ci/cli -m CLI_OK -q 1 -r
+
+          docker exec test_broker mosquitto_sub \
+            -h 127.0.0.1 -p 1883 \
+            -u "$MQTT_USER" -P "$MQTT_PASSWORD" \
+            -t ci/cli -C 1 -W 15 \
+            > /tmp/cli-output.txt
+
+          grep -qx "CLI_OK" /tmp/cli-output.txt
+
+          docker exec test_broker mosquitto_pub \
+            -h 127.0.0.1 -p 1883 \
+            -u "$MQTT_USER" -P "$MQTT_PASSWORD" \
+            -t ci/cli -n -r
+
+      - name: Cleanup
+        if: always()
+        run: |
+          docker logs test_broker 2>&1 || true
+          docker rm -f test_broker >/dev/null 2>&1 || true
+
+      - name: Save tested image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/tested-images
+
+          docker image inspect "$TEST_IMAGE" \
+            --format '{{.Id}}' \
+            > "/tmp/tested-images/${ARCH}.id"
+
+          docker save "$TEST_IMAGE" \
+            | gzip -1 > "/tmp/tested-images/${ARCH}.tar.gz"
+
+          test -s "/tmp/tested-images/${ARCH}.tar.gz"
+
+          echo "PASS: saved tested $ARCH image"
+          cat "/tmp/tested-images/${ARCH}.id"
+          ls -lh "/tmp/tested-images/${ARCH}.tar.gz"
+
+      - name: Upload tested image
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-image-${{ matrix.arch }}
+          path: |
+            /tmp/tested-images/${{ matrix.arch }}.tar.gz
+            /tmp/tested-images/${{ matrix.arch }}.id
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 1
+
+  publish:
+    needs: [check-upstream, build-and-test]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      IMAGE: solodolobolo/mosquitto
+      LWS_VERSION: ${{ needs.check-upstream.outputs.lws_version }}
+      CJSON_VERSION: ${{ needs.check-upstream.outputs.cjson_version }}
+      MOSQUITTO_VERSION: ${{ needs.check-upstream.outputs.mosq_version }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Download tested images
+        uses: actions/download-artifact@v4
+        with:
+          pattern: tested-image-*
+          merge-multiple: true
+          path: /tmp/tested-images
+
+      - name: Load and verify tested images
+        run: |
+          set -euo pipefail
+
+          for arch in amd64 arm64; do
+            echo "--- Loading tested $arch image ---"
+
+            gzip -dc "/tmp/tested-images/${arch}.tar.gz" \
+              | docker load
+
+            expected_id="$(cat "/tmp/tested-images/${arch}.id")"
+
+            actual_id="$(docker image inspect "mosquitto-ci:$arch" \
+              --format '{{.Id}}')"
+
+            actual_arch="$(docker image inspect "mosquitto-ci:$arch" \
+              --format '{{.Architecture}}')"
+
+            echo "Expected image ID: $expected_id"
+            echo "Actual image ID:   $actual_id"
+            echo "Expected architecture: $arch; actual: $actual_arch"
+
+            test "$actual_id" = "$expected_id"
+            test "$actual_arch" = "$arch"
+
+            echo "PASS: loaded the exact tested $arch image"
+          done
+
+      - name: Push tested architecture images
+        run: |
+          set -euo pipefail
+
+          mkdir -p /tmp/digests
+
+          for arch in amd64 arm64; do
+            echo "--- Pushing $IMAGE:$arch ---"
+
+            docker tag "mosquitto-ci:$arch" "$IMAGE:$arch"
+            docker push "$IMAGE:$arch"
+
+            digest="$(docker buildx imagetools inspect "$IMAGE:$arch" \
+              --format '{{.Manifest.Digest}}')"
+
+            [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]
+
+            printf '%s@%s\n' "$IMAGE" "$digest" \
+              > "/tmp/digests/${arch}.txt"
+
+            echo "PASS: pushed tested $arch image: $IMAGE@$digest"
+          done
+
+      - name: Publish tags
+        run: |
+          set -euo pipefail
+
+          amd64="$(cat /tmp/digests/amd64.txt)"
+          arm64="$(cat /tmp/digests/arm64.txt)"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:amd64" \
+            "$amd64"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:arm64" \
+            "$arm64"
+
+          docker buildx imagetools create \
+            --tag "$IMAGE:latest" \
+            "$amd64" \
+            "$arm64"
+
+      - name: Check manifests
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          image = os.environ["IMAGE"]
+
+          expected = {
+              "amd64": {("linux", "amd64")},
+              "arm64": {("linux", "arm64")},
+              "latest": {
+                  ("linux", "amd64"),
+                  ("linux", "arm64"),
+              },
+          }
+
+          for tag, required in expected.items():
+              reference = f"{image}:{tag}"
+
+              result = subprocess.run(
+                  [
+                      "docker", "buildx", "imagetools", "inspect",
+                      "--raw", reference,
+                  ],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+
+              manifest = json.loads(result.stdout)
+
+              platforms = {
+                  (
+                      item.get("platform", {}).get("os"),
+                      item.get("platform", {}).get("architecture"),
+                  )
+                  for item in manifest.get("manifests", [])
+              }
+
+              if platforms != required:
+                  raise RuntimeError(
+                      f"{reference}: expected {required}, found {platforms}"
+                  )
+
+              print(f"PASS: {reference} -> {sorted(platforms)}")
+          PY
+
+      - name: Update Dockerfile
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          from pathlib import Path
+
+          path = Path("Dockerfile")
+          text = path.read_text()
+
+          for argument in (
+              "LWS_VERSION",
+              "CJSON_VERSION",
+              "MOSQUITTO_VERSION",
+          ):
+              version = os.environ[argument]
+
+              if not re.fullmatch(r"\d+\.\d+\.\d+", version):
+                  raise RuntimeError(
+                      f"Invalid {argument}: {version!r}"
+                  )
+
+              pattern = re.compile(
+                  rf"^([ \t]*ARG[ \t]+{argument}[ \t]*=[ \t]*)"
+                  rf"([\"']?)(\d+\.\d+\.\d+)\2"
+                  rf"([ \t]*(?:#.*)?)$",
+                  re.MULTILINE,
+              )
+
+              def replace(match):
+                  prefix, quote, old_version, suffix = match.groups()
+                  print(f"{argument}: {old_version} -> {version}")
+                  return f"{prefix}{quote}{version}{quote}{suffix}"
+
+              text, count = pattern.subn(replace, text)
+
+              if count != 1:
+                  raise RuntimeError(
+                      f"Expected one {argument} declaration; found {count}"
+                  )
+
+          path.write_text(text)
+          PY
+
+      - name: Commit versions
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "github-actions[bot]@users.noreply.github.com"
+
+          git add Dockerfile
+
+          if git diff --cached --quiet; then
+            echo "Dockerfile versions unchanged; nothing to commit."
+            exit 0
+          fi
+
+          git diff --cached -- Dockerfile
+
+          git commit \
+            -m "chore: update Dockerfile to tested upstream versions"
+
+          git push origin "HEAD:${GITHUB_REF_NAME}"

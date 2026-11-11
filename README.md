@@ -1,6 +1,6 @@
 # Custom Eclipse Mosquitto Docker Image
 
-Containers built with this Dockerfile compile Mosquitto from source using published tarballs. It is specifically tailored to include **WebSockets** support via `libwebsockets` (v5.0.0) and features a unified volume structure with automated credential generation.
+Containers built with this Dockerfile compile Mosquitto from source using GitHub source archives. It is specifically tailored to include **WebSockets** support and features a unified volume structure with automated credential generation.
 
 ## Features
 
@@ -21,7 +21,6 @@ docker run -d --name mosquitto \
   -e MQTT_PASSWORD=my_secure_password \
   -v mosquitto_data:/mosquitto \
   solodolobolo/mosquitto:latest
-
 ```
 
 This will automatically create your credentials, pipe the broker logs directly to the Docker daemon (`docker logs mosquitto`), and save your persistent data in a Docker named volume.
@@ -42,7 +41,7 @@ Inside this volume, Mosquitto uses the following subdirectories:
 
 A production-ready `mosquitto.conf` is baked directly into the Docker image. By default, it requires authentication, enables WebSockets, and outputs logs to stdout.
 
-If you are using a **Docker named volume** (like the Quick Start above), the container will automatically copy the default configuration into your volume the first time it spins up. You can then edit it by executing into the container.
+If you are using a **Docker named volume** (like the Quick Start above), Docker automatically copies the default configuration into a new empty volume the first time it is mounted. You can then edit it by executing into the container.
 
 ### Using Local Bind Mounts
 
@@ -50,7 +49,7 @@ If you prefer to mount a local folder from your host machine, **do not mount an 
 
 ```bash
 # 1. Extract the default config from the image to your current local directory
-docker run --rm solodolobolo/mosquitto:latest cat /mosquitto/config/mosquitto.conf > ./mosquitto.conf
+docker run --rm --entrypoint /bin/cat solodolobolo/mosquitto:latest /mosquitto/config/mosquitto.conf > ./mosquitto.conf
 
 # 2. Edit your local ./mosquitto.conf file however you like
 
@@ -63,16 +62,16 @@ docker run -d --name mosquitto \
   -v $(pwd)/mosquitto.conf:/mosquitto/config/mosquitto.conf \
   -v mosquitto_data:/mosquitto/data \
   solodolobolo/mosquitto:latest
-
 ```
 
 ## Build Instructions
 
-Versions for Mosquitto, libwebsockets, and cJSON are securely pinned with SHA256 hashes inside the multi-stage Dockerfile.
+Default versions for Mosquitto, libwebsockets, and cJSON are declared as build arguments in the multi-stage Dockerfile. Builds download the selected versions from GitHub.
 
 To build the image locally:
 
 ```bash
 docker build -t solodolobolo/mosquitto:latest .
-
 ```
+
+To override the default versions, pass `--build-arg MOSQUITTO_VERSION=...`, `--build-arg LWS_VERSION=...`, or `--build-arg CJSON_VERSION=...`. Any arguments not supplied use their Dockerfile defaults.

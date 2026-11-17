@@ -4,7 +4,7 @@
 FROM alpine:3.23 AS builder
 
 # Use supplied build arguments, or these defaults when omitted
-ARG MOSQUITTO_VERSION=2.1.2
+ARG MOSQUITTO_VERSION=2.1.4
 ARG LWS_VERSION=5.1.0
 ARG CJSON_VERSION=1.7.19
 
